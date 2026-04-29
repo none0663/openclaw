@@ -8,6 +8,8 @@ import { extractToolCallsFromAssistant, extractToolResultId } from "./tool-call-
 import {
   REDACTED_SESSIONS_SPAWN_ATTACHMENT_CONTENT,
   SESSIONS_SPAWN_ATTACHMENT_METADATA_KEYS,
+  TOOL_CALL_NAME_MAX_CHARS,
+  TOOL_CALL_NAME_RE,
   isAllowedToolCallName,
   isRedactedSessionsSpawnAttachment,
   normalizeAllowedToolNames,
@@ -247,10 +249,18 @@ function normalizeToolResultName(
 
 export { makeMissingToolResult };
 
+export type DroppedToolCallInfo = {
+  id: string;
+  name: string;
+  reason: "missing_input" | "missing_id" | "invalid_name" | "not_in_allowlist";
+};
+
 export type ToolCallInputRepairReport = {
   messages: AgentMessage[];
   droppedToolCalls: number;
   droppedAssistantMessages: number;
+  /** Details about each dropped tool call for diagnostics/logging. */
+  droppedToolCallDetails: DroppedToolCallInfo[];
 };
 
 export type ToolCallInputRepairOptions = {
@@ -293,6 +303,7 @@ export function repairToolCallInputs(
   let droppedAssistantMessages = 0;
   let changed = false;
   const out: AgentMessage[] = [];
+  const droppedToolCallDetails: DroppedToolCallInfo[] = [];
   const allowedToolNames = normalizeAllowedToolNames(options?.allowedToolNames);
   const allowProviderOwnedThinkingReplay = options?.allowProviderOwnedThinkingReplay === true;
   const claimedReplaySafeToolCallIds = new Set<string>();
@@ -327,6 +338,21 @@ export function repairToolCallInputs(
         }
         out.push(msg);
       } else {
+        // Collect diagnostic details for the dropped thinking-replay turn so that
+        // callers logging `droppedToolCallDetails` do not see an empty list when
+        // `droppedToolCalls > 0`.
+        for (const block of msg.content) {
+          if (isRawToolCallBlock(block)) {
+            const rawBlock = block as RawToolCallBlock;
+            const rawId = typeof rawBlock.id === "string" ? rawBlock.id : "";
+            const rawName = typeof rawBlock.name === "string" ? rawBlock.name.trim() : "";
+            droppedToolCallDetails.push({
+              id: rawId,
+              name: rawName || "(empty)",
+              reason: "not_in_allowlist",
+            });
+          }
+        }
         droppedToolCalls += countRawToolCallBlocks(msg.content);
         droppedAssistantMessages += 1;
         changed = true;
@@ -349,6 +375,26 @@ export function repairToolCallInputs(
         droppedInMessage += 1;
         changed = true;
         messageChanged = true;
+        // Collect diagnostic details about why this tool call was dropped.
+        const rawBlock = block as RawToolCallBlock;
+        const rawId = typeof rawBlock.id === "string" ? rawBlock.id : "";
+        const rawName =
+          typeof rawBlock.name === "string" ? rawBlock.name.trim() : "";
+        let reason: DroppedToolCallInfo["reason"];
+        if (!hasToolCallInput(block)) {
+          reason = "missing_input";
+        } else if (!hasToolCallId(block)) {
+          reason = "missing_id";
+        } else if (
+          !rawName ||
+          rawName.length > TOOL_CALL_NAME_MAX_CHARS ||
+          !TOOL_CALL_NAME_RE.test(rawName)
+        ) {
+          reason = "invalid_name";
+        } else {
+          reason = "not_in_allowlist";
+        }
+        droppedToolCallDetails.push({ id: rawId, name: rawName || "(empty)", reason });
         continue;
       }
       if (isRawToolCallBlock(block)) {
@@ -415,6 +461,7 @@ export function repairToolCallInputs(
     messages: changed ? out : messages,
     droppedToolCalls,
     droppedAssistantMessages,
+    droppedToolCallDetails,
   };
 }
 
@@ -423,6 +470,17 @@ export function sanitizeToolCallInputs(
   options?: ToolCallInputRepairOptions,
 ): AgentMessage[] {
   return repairToolCallInputs(messages, options).messages;
+}
+
+/**
+ * Like {@link sanitizeToolCallInputs} but returns the full repair report,
+ * including details about which tool calls were dropped and why.
+ */
+export function sanitizeToolCallInputsWithReport(
+  messages: AgentMessage[],
+  options?: ToolCallInputRepairOptions,
+): ToolCallInputRepairReport {
+  return repairToolCallInputs(messages, options);
 }
 
 export function sanitizeToolUseResultPairing(
